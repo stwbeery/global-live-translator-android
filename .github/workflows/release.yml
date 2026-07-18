@@ -12,7 +12,6 @@ jobs:
     permissions:
       contents: write
     env:
-      ANDROID_RELEASE_KEYSTORE_PATH: ${{ runner.temp }}/global-live-translator-release.p12
       ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
       ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
       ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
@@ -39,12 +38,14 @@ jobs:
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
         run: |
+          ANDROID_RELEASE_KEYSTORE_PATH="$RUNNER_TEMP/global-live-translator-release.p12"
           test -n "$RELEASE_KEYSTORE_BASE64"
           test -n "$ANDROID_RELEASE_STORE_PASSWORD"
           test -n "$ANDROID_RELEASE_KEY_ALIAS"
           test -n "$ANDROID_RELEASE_KEY_PASSWORD"
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_RELEASE_KEYSTORE_PATH"
           chmod 600 "$ANDROID_RELEASE_KEYSTORE_PATH"
+          echo "ANDROID_RELEASE_KEYSTORE_PATH=$ANDROID_RELEASE_KEYSTORE_PATH" >> "$GITHUB_ENV"
 
       - name: Validate release version
         run: |
