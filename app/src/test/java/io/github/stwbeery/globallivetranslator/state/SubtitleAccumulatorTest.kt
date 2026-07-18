@@ -10,7 +10,7 @@ class SubtitleAccumulatorTest {
         accumulator.appendSource("Hello ")
         accumulator.appendSource("world")
         accumulator.appendTranslated("你好")
-        assertEquals(CaptionSnapshot("Hello world", "你好"), accumulator.appendTranslated("，世界"))
+        assertEquals(CaptionSnapshot("Hello world", "你好，世界"), accumulator.appendTranslated("，世界"))
     }
 
     @Test
