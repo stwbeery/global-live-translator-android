@@ -15,6 +15,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONObject
 import org.json.JSONArray
 import java.net.InetSocketAddress
@@ -152,7 +153,7 @@ class GeminiLiveSession(
         }
     }
 
-    private fun createListener(connectionGeneration: Long) = object : WebSocketListener() {
+    internal fun createListener(connectionGeneration: Long) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             val adopted = synchronized(lock) {
                 if (!started || generation != connectionGeneration) {
@@ -178,13 +179,11 @@ class GeminiLiveSession(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            if (!isCurrent(connectionGeneration)) return
-            val message = runCatching { JSONObject(text) }.getOrNull() ?: return
-            if (message.has("setupComplete")) {
-                handleSetupComplete(connectionGeneration, webSocket)
-                return
-            }
-            handleServerMessage(connectionGeneration, message)
+            handleIncomingJson(connectionGeneration, webSocket, text)
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            handleIncomingJson(connectionGeneration, webSocket, bytes.utf8())
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -230,6 +229,20 @@ class GeminiLiveSession(
                 handleDisconnect(connectionGeneration, sanitizeError(error.message ?: "网络连接失败"))
             }
         }
+    }
+
+    private fun handleIncomingJson(
+        connectionGeneration: Long,
+        webSocket: WebSocket,
+        payload: String,
+    ) {
+        if (!isCurrent(connectionGeneration)) return
+        val message = runCatching { JSONObject(payload) }.getOrNull() ?: return
+        if (message.has("setupComplete")) {
+            handleSetupComplete(connectionGeneration, webSocket)
+            return
+        }
+        handleServerMessage(connectionGeneration, message)
     }
 
     private fun handleSetupComplete(connectionGeneration: Long, webSocket: WebSocket) {

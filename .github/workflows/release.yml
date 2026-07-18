@@ -169,5 +169,5 @@ jobs:
               --verify-tag \
               --prerelease \
               --title "Global Live Translator Android v$VERSION_NAME" \
-              --notes "首个 Android 预发布版本。支持 Android 10+ 内部音频捕获、Gemini Live 实时翻译、悬浮字幕，以及 Clash Meta VPN/TUN 或手动代理。Gemini Live Translate 仍为 Preview；部分 DRM、通话及禁止音频捕获的 App 无法使用。"
+              --notes "修复 Gemini Live 将 setupComplete 和字幕作为 binary WebSocket 帧返回时，Android 客户端持续初始化超时并重连的问题。Gemini Live Translate 仍为 Preview；部分 DRM、通话及禁止音频捕获的 App 无法使用。"
           fi
