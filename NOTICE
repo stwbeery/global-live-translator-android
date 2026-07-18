@@ -1,0 +1,10 @@
+Global Live Translator Android
+
+This Android application was developed as a mobile companion to
+Global Live Translator, which was derived from NguyenKhanh's MIT-licensed
+live-translate-companion project:
+
+https://github.com/xShiroeNguyenx/live-translate-companion
+
+The Android implementation is original Kotlin code. The Gemini Live protocol,
+session behavior, and product concept were informed by the desktop project.
