@@ -7,92 +7,167 @@ on:
       - 'v*'
 
 jobs:
-  release:
+  validate:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    env:
-      ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
-      ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
-      ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
-      EXPECTED_CERT_SHA256: 82e09ad2059c7dd3cbd25261eee1fcec94b3daf223f27f69c7c67d8d9e48257e
-
+      contents: read
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-java@v4
+      - name: Validate trusted ref and release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          VERSION_NAME="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts)"
+          [[ "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          else
+            test "$GITHUB_REF_NAME" = "v$VERSION_NAME"
+          fi
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
 
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
         with:
           gradle-version: '8.9'
 
-      - name: Restore release keystore
+      - name: Test, lint, and build unsigned APK
+        run: gradle --no-daemon --no-configuration-cache :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
+
+      - name: Verify unsigned APK output
+        run: test -f app/build/outputs/apk/release/app-release-unsigned.apk
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: global-live-translator-android-unsigned
+          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      EXPECTED_CERT_SHA256: 82e09ad2059c7dd3cbd25261eee1fcec94b3daf223f27f69c7c67d8d9e48257e
+      VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+    steps:
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+
+      - name: Install Android build tools
+        run: sdkmanager "build-tools;35.0.0"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: global-live-translator-android-unsigned
+          path: unsigned
+
+      - name: Sign and verify APK
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
         run: |
-          ANDROID_RELEASE_KEYSTORE_PATH="$RUNNER_TEMP/global-live-translator-release.p12"
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/global-live-translator-release.p12"
+          ALIGNED_APK="$RUNNER_TEMP/global-live-translator-aligned.apk"
+          trap 'rm -f "$KEYSTORE" "$ALIGNED_APK"' EXIT
           test -n "$RELEASE_KEYSTORE_BASE64"
           test -n "$ANDROID_RELEASE_STORE_PASSWORD"
           test -n "$ANDROID_RELEASE_KEY_ALIAS"
           test -n "$ANDROID_RELEASE_KEY_PASSWORD"
-          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_RELEASE_KEYSTORE_PATH"
-          chmod 600 "$ANDROID_RELEASE_KEYSTORE_PATH"
-          echo "ANDROID_RELEASE_KEYSTORE_PATH=$ANDROID_RELEASE_KEYSTORE_PATH" >> "$GITHUB_ENV"
-
-      - name: Validate release version
-        run: |
-          VERSION_NAME="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts)"
-          test -n "$VERSION_NAME"
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            test "$GITHUB_REF_NAME" = "v$VERSION_NAME"
-          fi
-          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
-
-      - name: Test, lint, and build signed APK
-        run: gradle --no-daemon --no-configuration-cache :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
-
-      - name: Verify and package APK
-        run: |
-          APK="app/build/outputs/apk/release/app-release.apk"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+          mkdir -p dist
+          ZIPALIGN="$ANDROID_HOME/build-tools/35.0.0/zipalign"
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-          test -f "$APK"
+          "$ZIPALIGN" -P 16 -f 4 unsigned/app-release-unsigned.apk "$ALIGNED_APK"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$ANDROID_RELEASE_KEY_ALIAS" \
+            --ks-pass env:ANDROID_RELEASE_STORE_PASSWORD \
+            --key-pass env:ANDROID_RELEASE_KEY_PASSWORD \
+            --out "dist/global-live-translator-android-v$VERSION_NAME.apk" \
+            "$ALIGNED_APK"
+          APK="dist/global-live-translator-android-v$VERSION_NAME.apk"
           "$APKSIGNER" verify --verbose --print-certs "$APK"
           CERT_SHA256="$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')"
           test "$CERT_SHA256" = "$EXPECTED_CERT_SHA256"
-          mkdir -p dist
-          cp "$APK" "dist/global-live-translator-android-v$VERSION_NAME.apk"
           cd dist
           sha256sum "global-live-translator-android-v$VERSION_NAME.apk" > "global-live-translator-android-v$VERSION_NAME.apk.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: global-live-translator-android-release
-          path: dist/
+          path: |
+            dist/global-live-translator-android-v${{ env.VERSION_NAME }}.apk
+            dist/global-live-translator-android-v${{ env.VERSION_NAME }}.apk.sha256
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub prerelease
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "dist/global-live-translator-android-v$VERSION_NAME.apk" \
-            "dist/global-live-translator-android-v$VERSION_NAME.apk.sha256" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --prerelease \
-            --title "Global Live Translator Android v$VERSION_NAME" \
-            --notes "首个 Android 预发布版本。支持 Android 10+ 内部音频捕获、Gemini Live 实时翻译、悬浮字幕，以及 Clash Meta VPN/TUN 或手动代理。Gemini Live Translate 仍为 Preview；部分 DRM、通话及禁止音频捕获的 App 无法使用。"
+  publish:
+    if: github.event_name == 'push'
+    needs: [validate, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: global-live-translator-android-release
+          path: dist
 
-      - name: Remove release keystore
-        if: always()
-        run: rm -f "$ANDROID_RELEASE_KEYSTORE_PATH"
+      - name: Publish GitHub prerelease
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "dist/global-live-translator-android-v$VERSION_NAME.apk" \
+              "dist/global-live-translator-android-v$VERSION_NAME.apk.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/global-live-translator-android-v$VERSION_NAME.apk" \
+              "dist/global-live-translator-android-v$VERSION_NAME.apk.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --prerelease \
+              --title "Global Live Translator Android v$VERSION_NAME" \
+              --notes "首个 Android 预发布版本。支持 Android 10+ 内部音频捕获、Gemini Live 实时翻译、悬浮字幕，以及 Clash Meta VPN/TUN 或手动代理。Gemini Live Translate 仍为 Preview；部分 DRM、通话及禁止音频捕获的 App 无法使用。"
+          fi
