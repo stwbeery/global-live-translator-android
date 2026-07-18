@@ -42,6 +42,15 @@
 
 本 App 不录制或保存视频画面。录屏授权仅用于 Android 的内部音频捕获 API。
 
+## 下载与安装
+
+从 [GitHub Releases](https://github.com/stwbeery/global-live-translator-android/releases) 下载最新 APK。首个版本标记为预发布，因为 Gemini Live Translate 本身仍处于 Preview 阶段。
+
+- Android 可能提示允许安装未知来源应用，这是直接安装 GitHub APK 的正常流程。
+- Release APK 使用固定项目签名，后续版本可以直接覆盖升级。
+- 不要混装 Actions 中的 Debug APK 和 Release APK；二者签名不同，Android 不允许相互覆盖。
+- 每个 Release 同时提供 `.sha256` 文件，可用于校验下载完整性。
+
 ## 构建
 
 推荐 Android Studio Ladybug 或更高版本，JDK 17，Android SDK 35：
@@ -58,6 +67,8 @@ app/build/outputs/apk/debug/app-debug.apk
 ```
 
 仓库中的 `.github/workflows/android-ci.yml` 会执行单元测试、Lint 和 Debug APK 构建，并上传 APK artifact。
+
+`.github/workflows/release.yml` 可手动验证签名 Release 候选包；推送与 `versionName` 一致的 `v*` 标签时，会验证固定证书指纹并创建 GitHub prerelease。发布 keystore 和密码仅存放在 GitHub Actions Secrets 中，不进入仓库。
 
 ## 隐私和安全
 

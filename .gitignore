@@ -4,3 +4,7 @@ local.properties
 **/build/
 captures/
 *.iml
+*.jks
+*.keystore
+*.p12
+*.pem
