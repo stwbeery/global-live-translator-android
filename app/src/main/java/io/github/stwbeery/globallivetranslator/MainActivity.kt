@@ -45,6 +45,7 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -75,6 +76,7 @@ import io.github.stwbeery.globallivetranslator.data.SecureSettingsStore
 import io.github.stwbeery.globallivetranslator.service.TranslationService
 import io.github.stwbeery.globallivetranslator.state.TranslationPhase
 import io.github.stwbeery.globallivetranslator.state.TranslationStateStore
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -99,6 +101,9 @@ private fun TranslatorApp(settingsStore: SecureSettingsStore) {
     var proxyHost by rememberSaveable { mutableStateOf(initial.proxyHost) }
     var proxyPort by rememberSaveable { mutableStateOf(initial.proxyPort.toString()) }
     var overlayEnabled by rememberSaveable { mutableStateOf(initial.overlayEnabled) }
+    var overlayFontSizeSp by rememberSaveable { mutableStateOf(initial.overlayFontSizeSp) }
+    var overlayBackgroundOpacity by rememberSaveable { mutableStateOf(initial.overlayBackgroundOpacity) }
+    var overlayPositionLocked by rememberSaveable { mutableStateOf(initial.overlayPositionLocked) }
     var vadThreshold by rememberSaveable { mutableStateOf(initial.vadThresholdDb.toInt().toString()) }
     var formError by rememberSaveable { mutableStateOf<String?>(null) }
     var savedMessage by rememberSaveable { mutableStateOf<String?>(null) }
@@ -146,6 +151,27 @@ private fun TranslatorApp(settingsStore: SecureSettingsStore) {
     }
 
     val running = serviceState.phase !in setOf(TranslationPhase.IDLE, TranslationPhase.ERROR)
+    fun currentSettings() = AppSettings(
+        apiKey = apiKey,
+        targetLanguage = targetLanguage,
+        proxyMode = proxyMode,
+        proxyHost = proxyHost,
+        proxyPort = proxyPort.toIntOrNull() ?: 0,
+        overlayEnabled = overlayEnabled,
+        overlayFontSizeSp = overlayFontSizeSp,
+        overlayBackgroundOpacity = overlayBackgroundOpacity,
+        overlayPositionLocked = overlayPositionLocked,
+        vadThresholdDb = vadThreshold.toFloatOrNull() ?: Float.NaN,
+    )
+    fun saveOverlayAppearance() {
+        settingsStore.saveOverlayAppearance(
+            fontSizeSp = overlayFontSizeSp,
+            backgroundOpacity = overlayBackgroundOpacity,
+            positionLocked = overlayPositionLocked,
+        )
+        if (running) TranslationService.updateOverlay(context)
+    }
+
     Scaffold(
         containerColor = AppColors.Background,
         modifier = Modifier.fillMaxSize(),
@@ -175,15 +201,7 @@ private fun TranslatorApp(settingsStore: SecureSettingsStore) {
                     if (running) {
                         TranslationService.stop(context)
                     } else {
-                        val settings = AppSettings(
-                            apiKey = apiKey,
-                            targetLanguage = targetLanguage,
-                            proxyMode = proxyMode,
-                            proxyHost = proxyHost,
-                            proxyPort = proxyPort.toIntOrNull() ?: 0,
-                            overlayEnabled = overlayEnabled,
-                            vadThresholdDb = vadThreshold.toFloatOrNull() ?: Float.NaN,
-                        )
+                        val settings = currentSettings()
                         val error = settings.validate()
                         when {
                             error != null -> formError = error
@@ -255,7 +273,75 @@ private fun TranslatorApp(settingsStore: SecureSettingsStore) {
                     Text("显示悬浮字幕", fontWeight = FontWeight.Medium, color = AppColors.Ink)
                     Text("只保留当前一句译文", color = AppColors.Muted, fontSize = 13.sp)
                 }
-                Switch(checked = overlayEnabled, onCheckedChange = { overlayEnabled = it })
+                Switch(
+                    checked = overlayEnabled,
+                    onCheckedChange = { overlayEnabled = it },
+                    enabled = !running,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("字体大小", color = AppColors.Ink, modifier = Modifier.weight(1f))
+                Text("${overlayFontSizeSp.roundToInt()} sp", color = AppColors.Muted, fontSize = 13.sp)
+            }
+            Slider(
+                value = overlayFontSizeSp,
+                onValueChange = { overlayFontSizeSp = it },
+                onValueChangeFinished = ::saveOverlayAppearance,
+                valueRange = 14f..36f,
+                steps = 21,
+                enabled = overlayEnabled,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("背景不透明度", color = AppColors.Ink, modifier = Modifier.weight(1f))
+                Text(
+                    "${(overlayBackgroundOpacity * 100).roundToInt()}%",
+                    color = AppColors.Muted,
+                    fontSize = 13.sp,
+                )
+            }
+            Slider(
+                value = overlayBackgroundOpacity,
+                onValueChange = { overlayBackgroundOpacity = it },
+                onValueChangeFinished = ::saveOverlayAppearance,
+                valueRange = 0.15f..0.95f,
+                steps = 15,
+                enabled = overlayEnabled,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("锁定字幕位置", fontWeight = FontWeight.Medium, color = AppColors.Ink)
+                    Text("关闭后可直接拖动悬浮字幕", color = AppColors.Muted, fontSize = 13.sp)
+                }
+                Switch(
+                    checked = overlayPositionLocked,
+                    onCheckedChange = {
+                        overlayPositionLocked = it
+                        saveOverlayAppearance()
+                    },
+                    enabled = overlayEnabled,
+                )
+            }
+            TextButton(
+                onClick = {
+                    settingsStore.clearOverlayPosition()
+                    if (running) TranslationService.updateOverlay(context)
+                    savedMessage = "悬浮字幕位置已重置"
+                },
+                enabled = overlayEnabled,
+                modifier = Modifier.align(Alignment.End),
+            ) {
+                Text("重置字幕位置")
             }
 
             SectionHeader("Gemini", "密钥使用 Android Keystore 加密，只保存在本机")
@@ -325,15 +411,7 @@ private fun TranslatorApp(settingsStore: SecureSettingsStore) {
             TextButton(
                 enabled = !running,
                 onClick = {
-                    val settings = AppSettings(
-                        apiKey = apiKey,
-                        targetLanguage = targetLanguage,
-                        proxyMode = proxyMode,
-                        proxyHost = proxyHost,
-                        proxyPort = proxyPort.toIntOrNull() ?: 0,
-                        overlayEnabled = overlayEnabled,
-                        vadThresholdDb = vadThreshold.toFloatOrNull() ?: Float.NaN,
-                    )
+                    val settings = currentSettings()
                     settings.validate()?.let { formError = it } ?: run {
                         settingsStore.save(settings)
                         formError = null

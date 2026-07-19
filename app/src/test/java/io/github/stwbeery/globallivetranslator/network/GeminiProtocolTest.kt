@@ -19,7 +19,7 @@ class GeminiProtocolTest {
         val webSocket = FakeWebSocket()
 
         try {
-            session.start()
+            session.start(connectImmediately = false)
             val socketListener = session.createListener(0)
             socketListener.onMessage(webSocket, """{"setupComplete":{}}""".encodeUtf8())
             socketListener.onMessage(
@@ -29,10 +29,37 @@ class GeminiProtocolTest {
             )
 
             assertEquals(
-                listOf(GeminiSessionStatus.WAITING_FOR_AUDIO, GeminiSessionStatus.TRANSLATING),
+                listOf(
+                    GeminiSessionStatus.WAITING_FOR_AUDIO,
+                    GeminiSessionStatus.WAITING_FOR_AUDIO,
+                ),
                 listener.statuses,
             )
+            assertEquals(
+                listOf("等待手机声音", "Gemini 已连接，等待手机声音"),
+                listener.details,
+            )
             assertEquals(listOf("你好"), listener.translations)
+        } finally {
+            session.stop()
+        }
+    }
+
+    @Test
+    fun firstAudioAfterSetupTransitionsToTranslating() {
+        val listener = RecordingListener()
+        val session = GeminiLiveSession(AppSettings(), listener)
+        val webSocket = FakeWebSocket()
+
+        try {
+            session.start(connectImmediately = false)
+            session.createListener(0)
+                .onMessage(webSocket, """{"setupComplete":{}}""".encodeUtf8())
+
+            session.sendAudio(byteArrayOf(1, 2, 3, 4))
+
+            assertEquals(GeminiSessionStatus.TRANSLATING, listener.statuses.last())
+            assertEquals("正在实时翻译", listener.details.last())
         } finally {
             session.stop()
         }
@@ -76,10 +103,12 @@ class GeminiProtocolTest {
 
     private class RecordingListener : GeminiSessionListener {
         val statuses = mutableListOf<GeminiSessionStatus>()
+        val details = mutableListOf<String>()
         val translations = mutableListOf<String>()
 
         override fun onStatus(status: GeminiSessionStatus, detail: String) {
             statuses += status
+            details += detail
         }
 
         override fun onTranscript(

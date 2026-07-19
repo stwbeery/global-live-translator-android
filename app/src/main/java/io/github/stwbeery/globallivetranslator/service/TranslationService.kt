@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.ServiceInfo
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjection
@@ -45,12 +46,14 @@ class TranslationService : Service(), GeminiSessionListener {
     private var session: GeminiLiveSession? = null
     private var vad: VadGate? = null
     private var overlayEnabled = false
+    private var hasTranslatedCaption = false
+    @Volatile
     private var hasTerminalError = false
 
     override fun onCreate() {
         super.onCreate()
         settingsStore = SecureSettingsStore(this)
-        overlay = CaptionOverlay(this)
+        overlay = CaptionOverlay(this, settingsStore::saveOverlayPosition)
         createNotificationChannel()
     }
 
@@ -58,6 +61,13 @@ class TranslationService : Service(), GeminiSessionListener {
         when (intent?.action) {
             ACTION_STOP -> stopTranslation(manual = true)
             ACTION_START -> startTranslation(intent)
+            ACTION_UPDATE_OVERLAY -> {
+                if (capture != null && session != null) {
+                    updateOverlayAppearance()
+                } else {
+                    stopSelf(startId)
+                }
+            }
         }
         return START_NOT_STICKY
     }
@@ -72,34 +82,49 @@ class TranslationService : Service(), GeminiSessionListener {
     }
 
     override fun onStatus(status: GeminiSessionStatus, detail: String) {
-        if (stopping.get() || hasTerminalError) return
-        val phase = when (status) {
-            GeminiSessionStatus.WAITING_FOR_AUDIO -> TranslationPhase.WAITING_FOR_AUDIO
-            GeminiSessionStatus.CONNECTING -> TranslationPhase.CONNECTING
-            GeminiSessionStatus.TRANSLATING -> TranslationPhase.TRANSLATING
-            GeminiSessionStatus.RECONNECTING -> TranslationPhase.RECONNECTING
-            GeminiSessionStatus.STOPPED -> TranslationPhase.STOPPING
+        mainHandler.post {
+            if (stopping.get() || hasTerminalError) return@post
+            val phase = when (status) {
+                GeminiSessionStatus.WAITING_FOR_AUDIO -> TranslationPhase.WAITING_FOR_AUDIO
+                GeminiSessionStatus.CONNECTING -> TranslationPhase.CONNECTING
+                GeminiSessionStatus.TRANSLATING -> TranslationPhase.TRANSLATING
+                GeminiSessionStatus.RECONNECTING -> TranslationPhase.RECONNECTING
+                GeminiSessionStatus.STOPPED -> TranslationPhase.STOPPING
+            }
+            TranslationStateStore.setPhase(phase, detail)
+            updateNotification(detail)
+            if (overlayEnabled && !hasTranslatedCaption) overlay.show(detail)
         }
-        TranslationStateStore.setPhase(phase, detail)
-        updateNotification(detail)
     }
 
     override fun onTranscript(sourceFragment: String?, translatedFragment: String?, final: Boolean) {
-        var snapshot = sourceFragment?.let(subtitles::appendSource)
-        translatedFragment?.let { snapshot = subtitles.appendTranslated(it) }
-        if (final) snapshot = subtitles.finalizeSentence()
-        snapshot?.let {
-            TranslationStateStore.setCaption(it.source, it.translated)
-            if (overlayEnabled) overlay.show(it.translated)
+        mainHandler.post {
+            if (stopping.get() || hasTerminalError) return@post
+            var snapshot = sourceFragment?.let(subtitles::appendSource)
+            translatedFragment?.let { snapshot = subtitles.appendTranslated(it) }
+            if (final) snapshot = subtitles.finalizeSentence()
+            snapshot?.let { updated ->
+                TranslationStateStore.setCaption(updated.source, updated.translated)
+                if (overlayEnabled && translatedFragment != null && updated.translated.isNotBlank()) {
+                    hasTranslatedCaption = true
+                    overlay.show(updated.translated)
+                }
+            }
         }
     }
 
     override fun onAudioSent(bytes: Int) {
+        if (stopping.get() || hasTerminalError) return
         TranslationStateStore.addBytesSent(bytes)
     }
 
     override fun onError(message: String) {
-        fail(message)
+        mainHandler.post { fail(message) }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (overlayEnabled && !stopping.get()) updateOverlayAppearance()
     }
 
     private fun startTranslation(intent: Intent) {
@@ -137,7 +162,11 @@ class TranslationService : Service(), GeminiSessionListener {
         )
 
         overlayEnabled = settings.overlayEnabled
+        hasTranslatedCaption = false
         subtitles.clear()
+        if (overlayEnabled) {
+            overlay.attach(settings, settingsStore.loadOverlayPosition(), "正在连接 Gemini")
+        }
         val liveSession = GeminiLiveSession(settings, this)
         session = liveSession
         vad = VadGate(thresholdDb = settings.vadThresholdDb)
@@ -151,13 +180,15 @@ class TranslationService : Service(), GeminiSessionListener {
                     }
                 }
             },
-            onError = { error -> fail(error.message ?: "内部音频采集失败") },
+            onError = { error ->
+                mainHandler.post { fail(error.message ?: "内部音频采集失败") }
+            },
         )
         capture = playbackCapture
-        liveSession.start()
-        playbackCapture.start()
         TranslationStateStore.setPhase(TranslationPhase.WAITING_FOR_AUDIO, "等待手机声音")
         updateNotification("等待手机声音")
+        liveSession.start()
+        playbackCapture.start()
     }
 
     private fun stopTranslation(manual: Boolean) {
@@ -189,6 +220,20 @@ class TranslationService : Service(), GeminiSessionListener {
         mediaProjection = null
         runCatching { projection?.stop() }
         overlay.remove()
+        hasTranslatedCaption = false
+    }
+
+    private fun updateOverlayAppearance() {
+        if (capture == null || session == null) return
+        val settings = settingsStore.load()
+        overlayEnabled = settings.overlayEnabled
+        if (overlayEnabled) {
+            val state = TranslationStateStore.state.value
+            val currentText = state.translatedText.takeIf { it.isNotBlank() } ?: state.status
+            overlay.attach(settings, settingsStore.loadOverlayPosition(), currentText)
+        } else {
+            overlay.remove()
+        }
     }
 
     private fun startForegroundNotification(status: String) {
@@ -260,6 +305,7 @@ class TranslationService : Service(), GeminiSessionListener {
     companion object {
         private const val ACTION_START = "io.github.stwbeery.globallivetranslator.START"
         private const val ACTION_STOP = "io.github.stwbeery.globallivetranslator.STOP"
+        private const val ACTION_UPDATE_OVERLAY = "io.github.stwbeery.globallivetranslator.UPDATE_OVERLAY"
         private const val EXTRA_RESULT_CODE = "result_code"
         private const val EXTRA_RESULT_DATA = "result_data"
         private const val NOTIFICATION_CHANNEL_ID = "live_translation"
@@ -276,6 +322,12 @@ class TranslationService : Service(), GeminiSessionListener {
         fun stop(context: Context) {
             context.startService(
                 Intent(context, TranslationService::class.java).setAction(ACTION_STOP),
+            )
+        }
+
+        fun updateOverlay(context: Context) {
+            context.startService(
+                Intent(context, TranslationService::class.java).setAction(ACTION_UPDATE_OVERLAY),
             )
         }
     }

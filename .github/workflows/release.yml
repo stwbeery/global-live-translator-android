@@ -169,5 +169,5 @@ jobs:
               --verify-tag \
               --prerelease \
               --title "Global Live Translator Android v$VERSION_NAME" \
-              --notes "修复 Gemini Live 将 setupComplete 和字幕作为 binary WebSocket 帧返回时，Android 客户端持续初始化超时并重连的问题。Gemini Live Translate 仍为 Preview；部分 DRM、通话及禁止音频捕获的 App 无法使用。"
+              --notes "点击开始后立即预连接 Gemini 并显示悬浮状态；修复长字幕填满后不再更新和片段积压问题；悬浮字幕现在只保留当前一句，并支持拖动、字号、背景不透明度、位置锁定与重置。Gemini Live Translate 仍为 Preview；部分 DRM、通话及禁止音频捕获的 App 无法使用。"
           fi

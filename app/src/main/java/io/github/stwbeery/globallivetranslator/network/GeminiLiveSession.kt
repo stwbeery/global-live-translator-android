@@ -1,6 +1,5 @@
 package io.github.stwbeery.globallivetranslator.network
 
-import android.util.Base64
 import io.github.stwbeery.globallivetranslator.data.AppSettings
 import io.github.stwbeery.globallivetranslator.data.ProxyMode
 import kotlinx.coroutines.CoroutineScope
@@ -22,6 +21,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.URLEncoder
 import java.util.ArrayDeque
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 
 interface GeminiSessionListener {
@@ -51,6 +51,7 @@ class GeminiLiveSession(
     private var terminal = false
     private var connecting = false
     private var ready = false
+    private var audioActive = false
     private var generation = 0L
     private var reconnectAttempt = 0
     private var resumptionHandle: String? = null
@@ -59,26 +60,37 @@ class GeminiLiveSession(
     private var reconnectJob: Job? = null
     private var setupTimeoutJob: Job? = null
     private var idleCloseJob: Job? = null
+    private var idleCloseToken = 0L
     private var goAwayJob: Job? = null
 
-    fun start() {
+    fun start(connectImmediately: Boolean = true) {
         synchronized(lock) {
             if (started) return
             started = true
             terminal = false
         }
-        listener.onStatus(GeminiSessionStatus.WAITING_FOR_AUDIO, "等待手机声音")
+        if (connectImmediately) {
+            connect(isReconnect = false)
+        } else {
+            listener.onStatus(GeminiSessionStatus.WAITING_FOR_AUDIO, "等待手机声音")
+        }
     }
 
     fun sendAudio(pcm: ByteArray) {
         var directSocket: WebSocket? = null
         var shouldConnect = false
+        var becameActive = false
         synchronized(lock) {
             if (!started || terminal) return
             idleCloseJob?.cancel()
             idleCloseJob = null
+            idleCloseToken++
             if (ready) {
                 directSocket = socket
+                if (!audioActive) {
+                    audioActive = true
+                    becameActive = true
+                }
             } else {
                 queue.addLast(pcm.copyOf())
                 while (queue.size > MAX_QUEUED_FRAMES) queue.removeFirst()
@@ -86,6 +98,9 @@ class GeminiLiveSession(
             }
         }
         if (directSocket != null) {
+            if (becameActive) {
+                listener.onStatus(GeminiSessionStatus.TRANSLATING, "正在实时翻译")
+            }
             sendFrame(directSocket!!, pcm)
         } else if (shouldConnect) {
             connect(isReconnect = false)
@@ -100,6 +115,7 @@ class GeminiLiveSession(
                 pendingStreamEnd = true
                 return
             }
+            audioActive = false
             currentSocket = socket
         }
         currentSocket?.send(audioStreamEndMessage())
@@ -115,6 +131,7 @@ class GeminiLiveSession(
             generation++
             connecting = false
             ready = false
+            audioActive = false
             currentSocket = socket
             socket = null
             queue.clear()
@@ -168,13 +185,20 @@ class GeminiLiveSession(
                 return
             }
             webSocket.send(setupMessage(settings.targetLanguage, resumptionHandle))
-            setupTimeoutJob?.cancel()
-            setupTimeoutJob = scope.launch {
+            val timeoutJob = scope.launch {
                 delay(SETUP_TIMEOUT_MS)
                 val timedOut = synchronized(lock) {
                     started && generation == connectionGeneration && !ready
                 }
                 if (timedOut) rotateConnection(connectionGeneration, "Gemini 初始化超时")
+            }
+            synchronized(lock) {
+                if (started && generation == connectionGeneration && !ready) {
+                    setupTimeoutJob?.cancel()
+                    setupTimeoutJob = timeoutJob
+                } else {
+                    timeoutJob.cancel()
+                }
             }
         }
 
@@ -247,6 +271,7 @@ class GeminiLiveSession(
 
     private fun handleSetupComplete(connectionGeneration: Long, webSocket: WebSocket) {
         val sendEnd: Boolean
+        val hadQueuedAudio: Boolean
         synchronized(lock) {
             if (!started || generation != connectionGeneration) return
             socket = webSocket
@@ -255,13 +280,18 @@ class GeminiLiveSession(
             connecting = false
             ready = true
             reconnectAttempt = 0
+            hadQueuedAudio = queue.isNotEmpty()
             while (queue.isNotEmpty()) sendFrame(webSocket, queue.removeFirst())
             sendEnd = pendingStreamEnd
             pendingStreamEnd = false
+            audioActive = hadQueuedAudio && !sendEnd
             if (sendEnd) webSocket.send(audioStreamEndMessage())
+            listener.onStatus(
+                if (hadQueuedAudio) GeminiSessionStatus.TRANSLATING else GeminiSessionStatus.WAITING_FOR_AUDIO,
+                if (hadQueuedAudio) "正在实时翻译" else "Gemini 已连接，等待手机声音",
+            )
         }
-        listener.onStatus(GeminiSessionStatus.TRANSLATING, "正在实时翻译")
-        if (sendEnd) scheduleIdleClose()
+        if (sendEnd || !hadQueuedAudio) scheduleIdleClose()
     }
 
     private fun handleServerMessage(connectionGeneration: Long, message: JSONObject) {
@@ -305,6 +335,7 @@ class GeminiLiveSession(
             socket = null
             connecting = false
             ready = false
+            audioActive = false
             retryDelay = RECONNECT_DELAYS_MS[reconnectAttempt.coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)]
             reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)
             if (reconnectJob != null) return
@@ -331,6 +362,7 @@ class GeminiLiveSession(
             socket = null
             connecting = false
             ready = false
+            audioActive = false
             queue.clear()
             pendingStreamEnd = false
             cancelTimersLocked()
@@ -348,6 +380,7 @@ class GeminiLiveSession(
             socket = null
             connecting = false
             ready = false
+            audioActive = false
             setupTimeoutJob?.cancel()
             setupTimeoutJob = null
         }
@@ -368,21 +401,25 @@ class GeminiLiveSession(
     private fun scheduleIdleClose() {
         synchronized(lock) {
             idleCloseJob?.cancel()
+            val idleToken = ++idleCloseToken
             val currentGeneration = generation
             idleCloseJob = scope.launch {
                 delay(IDLE_CLOSE_MS)
                 val oldSocket: WebSocket?
                 synchronized(lock) {
-                    if (!started || generation != currentGeneration) return@launch
+                    if (!started || generation != currentGeneration || idleCloseToken != idleToken) {
+                        return@launch
+                    }
                     generation++
                     oldSocket = socket
                     socket = null
                     connecting = false
                     ready = false
+                    audioActive = false
                     idleCloseJob = null
+                    listener.onStatus(GeminiSessionStatus.WAITING_FOR_AUDIO, "等待手机声音")
                 }
                 oldSocket?.close(1000, "idle")
-                listener.onStatus(GeminiSessionStatus.WAITING_FOR_AUDIO, "等待手机声音")
             }
         }
     }
@@ -399,6 +436,7 @@ class GeminiLiveSession(
         reconnectJob?.cancel()
         setupTimeoutJob?.cancel()
         idleCloseJob?.cancel()
+        idleCloseToken++
         goAwayJob?.cancel()
         reconnectJob = null
         setupTimeoutJob = null
@@ -463,7 +501,7 @@ class GeminiLiveSession(
                 JSONObject().put(
                     "audio",
                     JSONObject()
-                        .put("data", Base64.encodeToString(pcm, Base64.NO_WRAP))
+                        .put("data", Base64.getEncoder().encodeToString(pcm))
                         .put("mimeType", "audio/pcm;rate=16000"),
                 ),
             )
