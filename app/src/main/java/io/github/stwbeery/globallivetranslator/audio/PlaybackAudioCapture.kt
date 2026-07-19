@@ -18,6 +18,7 @@ class PlaybackAudioCapture(
     private val projection: MediaProjection,
     private val onFrame: (ByteArray) -> Unit,
     private val onError: (Throwable) -> Unit,
+    private val onDiagnostics: (CaptureDiagnostics) -> Unit = {},
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val running = AtomicBoolean(false)
@@ -33,13 +34,42 @@ class PlaybackAudioCapture(
                 val resampler = StreamingPcmResampler(spec.sampleRate, spec.channels)
                 val assembler = PcmFrameAssembler()
                 val input = ShortArray(spec.sampleRate * spec.channels / 10)
+                var readSamples = 0L
+                var outputFrames = 0L
+                var lastRawDbFs = -120f
+                var lastOutputDbFs = -120f
+                var lastDiagnosticsAt = 0L
                 spec.record.startRecording()
                 while (isActive && running.get()) {
                     val read = spec.record.read(input, 0, input.size, AudioRecord.READ_BLOCKING)
                     when {
-                        read > 0 -> assembler.append(resampler.process(input, read), onFrame)
+                        read > 0 -> assembler.append(resampler.process(input, read)) { frame ->
+                            outputFrames++
+                            lastOutputDbFs = pcm16LeDbFs(frame)
+                            onFrame(frame)
+                        }
                         read == AudioRecord.ERROR_DEAD_OBJECT -> error("系统音频采集设备已断开")
                         read < 0 -> error("读取系统音频失败：$read")
+                    }
+                    if (read > 0) {
+                        readSamples += read
+                        lastRawDbFs = pcm16DbFs(input, read)
+                        val now = System.nanoTime()
+                        if (lastDiagnosticsAt == 0L || now - lastDiagnosticsAt >= DIAGNOSTICS_INTERVAL_NS) {
+                            lastDiagnosticsAt = now
+                            runCatching {
+                                onDiagnostics(
+                                    CaptureDiagnostics(
+                                        readSamples = readSamples,
+                                        outputFrames = outputFrames,
+                                        rawDbFs = lastRawDbFs,
+                                        outputDbFs = lastOutputDbFs,
+                                        sampleRate = spec.sampleRate,
+                                        channels = spec.channels,
+                                    ),
+                                )
+                            }
+                        }
                     }
                 }
             } catch (error: Throwable) {
@@ -119,4 +149,17 @@ class PlaybackAudioCapture(
         val sampleRate: Int,
         val channels: Int,
     )
+
+    private companion object {
+        const val DIAGNOSTICS_INTERVAL_NS = 5_000_000_000L
+    }
 }
+
+data class CaptureDiagnostics(
+    val readSamples: Long,
+    val outputFrames: Long,
+    val rawDbFs: Float,
+    val outputDbFs: Float,
+    val sampleRate: Int,
+    val channels: Int,
+)

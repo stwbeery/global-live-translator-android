@@ -23,12 +23,23 @@ import java.net.URLEncoder
 import java.util.ArrayDeque
 import java.util.Base64
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 interface GeminiSessionListener {
     fun onStatus(status: GeminiSessionStatus, detail: String)
     fun onTranscript(sourceFragment: String?, translatedFragment: String?, final: Boolean)
     fun onAudioSent(bytes: Int)
+    fun onDiagnostics(message: String) = Unit
     fun onError(message: String)
+}
+
+internal enum class GeminiMessageKind {
+    SETUP_COMPLETE,
+    SERVER_ERROR,
+    SERVER_CONTENT,
+    SESSION_RESUMPTION,
+    GO_AWAY,
+    OTHER,
 }
 
 enum class GeminiSessionStatus {
@@ -62,6 +73,18 @@ class GeminiLiveSession(
     private var idleCloseJob: Job? = null
     private var idleCloseToken = 0L
     private var goAwayJob: Job? = null
+    private val receivedMessages = AtomicLong()
+    private val receivedServerContents = AtomicLong()
+    private val receivedSourceTranscriptions = AtomicLong()
+    private val receivedOutputTranscriptions = AtomicLong()
+    private val receivedModelTexts = AtomicLong()
+    private val receivedModelTurns = AtomicLong()
+    private val invalidMessages = AtomicLong()
+    private val sentAudioFrames = AtomicLong()
+    private val sentAudioBytes = AtomicLong()
+    private val rejectedAudioFrames = AtomicLong()
+    private val droppedQueuedFrames = AtomicLong()
+    private val lastDiagnosticsAtNs = AtomicLong()
 
     fun start(connectImmediately: Boolean = true) {
         synchronized(lock) {
@@ -93,7 +116,10 @@ class GeminiLiveSession(
                 }
             } else {
                 queue.addLast(pcm.copyOf())
-                while (queue.size > MAX_QUEUED_FRAMES) queue.removeFirst()
+                while (queue.size > MAX_QUEUED_FRAMES) {
+                    queue.removeFirst()
+                    droppedQueuedFrames.incrementAndGet()
+                }
                 shouldConnect = !connecting && socket == null && reconnectJob == null
             }
         }
@@ -142,6 +168,7 @@ class GeminiLiveSession(
         client.connectionPool.evictAll()
         client.dispatcher.executorService.shutdown()
         scope.cancel()
+        emitNetworkDiagnostics(force = true)
         listener.onStatus(GeminiSessionStatus.STOPPED, "已停止")
     }
 
@@ -160,6 +187,7 @@ class GeminiLiveSession(
             if (isReconnect) GeminiSessionStatus.RECONNECTING else GeminiSessionStatus.CONNECTING,
             if (isReconnect) "正在重新连接" else "正在连接 Gemini",
         )
+        diagnostic("Gemini connect generation=$connectionGeneration reconnect=$isReconnect")
         val newSocket = client.newWebSocket(request, createListener(connectionGeneration))
         synchronized(lock) {
             if (started && generation == connectionGeneration && (connecting || ready)) {
@@ -184,7 +212,15 @@ class GeminiLiveSession(
                 webSocket.close(1000, "stale")
                 return
             }
-            webSocket.send(setupMessage(settings.targetLanguage, resumptionHandle))
+            val setupAccepted = webSocket.send(setupMessage(settings.targetLanguage, resumptionHandle))
+            diagnostic(
+                "Gemini open generation=$connectionGeneration http=${response.code} setupAccepted=$setupAccepted",
+            )
+            if (!setupAccepted) {
+                webSocket.cancel()
+                handleDisconnect(connectionGeneration, "Gemini 初始化消息发送失败")
+                return
+            }
             val timeoutJob = scope.launch {
                 delay(SETUP_TIMEOUT_MS)
                 val timedOut = synchronized(lock) {
@@ -211,6 +247,7 @@ class GeminiLiveSession(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            diagnostic("Gemini closed generation=$connectionGeneration code=$code")
             val normalizedReason = sanitizeError(reason)
             val retryWithoutResumption = synchronized(lock) {
                 val mentionsResumption = normalizedReason.contains("resum", ignoreCase = true) ||
@@ -235,6 +272,7 @@ class GeminiLiveSession(
 
         override fun onFailure(webSocket: WebSocket, error: Throwable, response: Response?) {
             val code = response?.code
+            diagnostic("Gemini failure generation=$connectionGeneration http=${code ?: 0}")
             if (code != null && code in 400..499 && code !in setOf(408, 425, 429)) {
                 val retryWithoutResumption = synchronized(lock) {
                     if (started && generation == connectionGeneration && code == 400 && resumptionHandle != null) {
@@ -261,8 +299,23 @@ class GeminiLiveSession(
         payload: String,
     ) {
         if (!isCurrent(connectionGeneration)) return
-        val message = runCatching { JSONObject(payload) }.getOrNull() ?: return
+        val message = runCatching { JSONObject(payload) }.getOrNull()
+        if (message == null) {
+            invalidMessages.incrementAndGet()
+            emitNetworkDiagnostics()
+            return
+        }
+        receivedMessages.incrementAndGet()
+        val messageKind = classifyMessage(message)
+        message.optJSONObject("error")?.let { error ->
+            val reason = serverErrorMessage(error)
+            diagnostic("Gemini message kind=$messageKind")
+            emitNetworkDiagnostics(force = true)
+            handleTerminal(connectionGeneration, reason)
+            return
+        }
         if (message.has("setupComplete")) {
+            diagnostic("Gemini message kind=$messageKind")
             handleSetupComplete(connectionGeneration, webSocket)
             return
         }
@@ -272,6 +325,7 @@ class GeminiLiveSession(
     private fun handleSetupComplete(connectionGeneration: Long, webSocket: WebSocket) {
         val sendEnd: Boolean
         val hadQueuedAudio: Boolean
+        val queuedAudioFrames: Int
         synchronized(lock) {
             if (!started || generation != connectionGeneration) return
             socket = webSocket
@@ -281,6 +335,7 @@ class GeminiLiveSession(
             ready = true
             reconnectAttempt = 0
             hadQueuedAudio = queue.isNotEmpty()
+            queuedAudioFrames = queue.size
             while (queue.isNotEmpty()) sendFrame(webSocket, queue.removeFirst())
             sendEnd = pendingStreamEnd
             pendingStreamEnd = false
@@ -291,20 +346,32 @@ class GeminiLiveSession(
                 if (hadQueuedAudio) "正在实时翻译" else "Gemini 已连接，等待手机声音",
             )
         }
+        diagnostic(
+            "Gemini setupComplete generation=$connectionGeneration queuedAudioFrames=$queuedAudioFrames " +
+                "pendingStreamEnd=$sendEnd",
+        )
         if (sendEnd || !hadQueuedAudio) scheduleIdleClose()
     }
 
     private fun handleServerMessage(connectionGeneration: Long, message: JSONObject) {
         val serverContent = message.optJSONObject("serverContent")
         if (serverContent != null) {
+            receivedServerContents.incrementAndGet()
             val source = serverContent.optJSONObject("inputTranscription")
                 ?.optString("text")
                 ?.takeIf { it.isNotEmpty() }
-            val translated = serverContent.optJSONObject("outputTranscription")
+            val outputTranscription = serverContent.optJSONObject("outputTranscription")
                 ?.optString("text")
                 ?.takeIf { it.isNotEmpty() }
+            val modelText = extractModelText(serverContent)
+            val translated = outputTranscription ?: modelText
             val final = serverContent.optBoolean("turnComplete") ||
                 serverContent.optBoolean("generationComplete")
+            if (source != null) receivedSourceTranscriptions.incrementAndGet()
+            if (outputTranscription != null) receivedOutputTranscriptions.incrementAndGet()
+            if (modelText != null) receivedModelTexts.incrementAndGet()
+            if (serverContent.optJSONObject("modelTurn") != null) receivedModelTurns.incrementAndGet()
+            emitNetworkDiagnostics()
             if (source != null || translated != null || final) {
                 listener.onTranscript(source, translated, final)
             }
@@ -425,7 +492,39 @@ class GeminiLiveSession(
     }
 
     private fun sendFrame(webSocket: WebSocket, pcm: ByteArray) {
-        if (webSocket.send(audioMessage(pcm))) listener.onAudioSent(pcm.size)
+        if (webSocket.send(audioMessage(pcm))) {
+            sentAudioFrames.incrementAndGet()
+            sentAudioBytes.addAndGet(pcm.size.toLong())
+            listener.onAudioSent(pcm.size)
+        } else {
+            rejectedAudioFrames.incrementAndGet()
+        }
+        emitNetworkDiagnostics()
+    }
+
+    private fun emitNetworkDiagnostics(force: Boolean = false) {
+        val now = System.nanoTime()
+        if (!force) {
+            while (true) {
+                val previous = lastDiagnosticsAtNs.get()
+                if (previous != 0L && now - previous < DIAGNOSTICS_INTERVAL_NS) return
+                if (lastDiagnosticsAtNs.compareAndSet(previous, now)) break
+            }
+        } else {
+            lastDiagnosticsAtNs.set(now)
+        }
+        diagnostic(
+            "Gemini stats received=${receivedMessages.get()} serverContent=${receivedServerContents.get()} " +
+                "source=${receivedSourceTranscriptions.get()} output=${receivedOutputTranscriptions.get()} " +
+                "modelTurn=${receivedModelTurns.get()} modelText=${receivedModelTexts.get()} " +
+                "invalid=${invalidMessages.get()} " +
+                "sentFrames=${sentAudioFrames.get()} sentBytes=${sentAudioBytes.get()} " +
+                "sendRejected=${rejectedAudioFrames.get()} queueDropped=${droppedQueuedFrames.get()}",
+        )
+    }
+
+    private fun diagnostic(message: String) {
+        runCatching { listener.onDiagnostics(message) }
     }
 
     private fun isCurrent(connectionGeneration: Long): Boolean = synchronized(lock) {
@@ -452,6 +551,7 @@ class GeminiLiveSession(
         const val SETUP_TIMEOUT_MS = 15_000L
         const val IDLE_CLOSE_MS = 5 * 60 * 1000L
         const val GO_AWAY_MARGIN_MS = 2_000L
+        const val DIAGNOSTICS_INTERVAL_NS = 5_000_000_000L
         val RECONNECT_DELAYS_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 15_000)
 
         fun buildClient(settings: AppSettings): OkHttpClient {
@@ -526,7 +626,44 @@ class GeminiLiveSession(
 
         fun sanitizeError(message: String): String = message
             .replace(Regex("([?&]key=)[^&\\s]+", RegexOption.IGNORE_CASE), "${'$'}1[redacted]")
+            .replace(Regex("\\bAIza[0-9A-Za-z_-]{20,}\\b"), "[redacted-api-key]")
+            .replace(
+                Regex("((?:api[ _-]?key|key)\\s*[:=]\\s*)[^\\s,;]+", RegexOption.IGNORE_CASE),
+                "${'$'}1[redacted]",
+            )
             .take(240)
+
+        fun serverErrorMessage(error: JSONObject): String {
+            val code = error.optInt("code").takeIf { it != 0 }
+            val status = error.optString("status").takeIf { it.matches(Regex("[A-Z0-9_]{1,64}")) }
+            return listOfNotNull(
+                "Gemini 返回错误",
+                code?.let { "code=$it" },
+                status?.let { "status=$it" },
+            ).joinToString(" · ")
+        }
+
+        fun classifyMessage(message: JSONObject): GeminiMessageKind = when {
+            message.has("setupComplete") -> GeminiMessageKind.SETUP_COMPLETE
+            message.has("error") -> GeminiMessageKind.SERVER_ERROR
+            message.has("serverContent") -> GeminiMessageKind.SERVER_CONTENT
+            message.has("sessionResumptionUpdate") -> GeminiMessageKind.SESSION_RESUMPTION
+            message.has("goAway") -> GeminiMessageKind.GO_AWAY
+            else -> GeminiMessageKind.OTHER
+        }
+
+        fun extractModelText(serverContent: JSONObject): String? {
+            val parts = serverContent.optJSONObject("modelTurn")?.optJSONArray("parts") ?: return null
+            val text = buildString {
+                for (index in 0 until parts.length()) {
+                    val part = parts.optJSONObject(index) ?: continue
+                    if (part.optBoolean("thought")) continue
+                    val partText = part.optString("text").takeIf { it.isNotEmpty() }
+                    if (partText != null) append(partText)
+                }
+            }
+            return text.takeIf { it.isNotEmpty() }
+        }
 
         fun isTerminalCloseCode(code: Int): Boolean =
             code in 4000..4999 || code in setOf(1002, 1003, 1007, 1008, 1009)

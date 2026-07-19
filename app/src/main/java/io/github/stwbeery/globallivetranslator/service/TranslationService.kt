@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -34,6 +35,7 @@ import io.github.stwbeery.globallivetranslator.state.SubtitleAccumulator
 import io.github.stwbeery.globallivetranslator.state.TranslationPhase
 import io.github.stwbeery.globallivetranslator.state.TranslationStateStore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class TranslationService : Service(), GeminiSessionListener {
     private val stopping = AtomicBoolean(false)
@@ -47,6 +49,8 @@ class TranslationService : Service(), GeminiSessionListener {
     private var vad: VadGate? = null
     private var overlayEnabled = false
     private var hasTranslatedCaption = false
+    private val vadAudioFrames = AtomicLong()
+    private val sentAudioBytes = AtomicLong()
     @Volatile
     private var hasTerminalError = false
 
@@ -115,7 +119,12 @@ class TranslationService : Service(), GeminiSessionListener {
 
     override fun onAudioSent(bytes: Int) {
         if (stopping.get() || hasTerminalError) return
+        sentAudioBytes.addAndGet(bytes.toLong())
         TranslationStateStore.addBytesSent(bytes)
+    }
+
+    override fun onDiagnostics(message: String) {
+        Log.d(LOG_TAG, message)
     }
 
     override fun onError(message: String) {
@@ -163,6 +172,8 @@ class TranslationService : Service(), GeminiSessionListener {
 
         overlayEnabled = settings.overlayEnabled
         hasTranslatedCaption = false
+        vadAudioFrames.set(0)
+        sentAudioBytes.set(0)
         subtitles.clear()
         if (overlayEnabled) {
             overlay.attach(settings, settingsStore.loadOverlayPosition(), "正在连接 Gemini")
@@ -175,10 +186,22 @@ class TranslationService : Service(), GeminiSessionListener {
             onFrame = { frame ->
                 vad?.process(frame)?.forEach { event ->
                     when (event) {
-                        is VadEvent.Audio -> liveSession.sendAudio(event.pcm)
+                        is VadEvent.Audio -> {
+                            vadAudioFrames.incrementAndGet()
+                            liveSession.sendAudio(event.pcm)
+                        }
                         VadEvent.StreamEnd -> liveSession.sendAudioStreamEnd()
                     }
                 }
+            },
+            onDiagnostics = { diagnostics ->
+                Log.d(
+                    LOG_TAG,
+                    "Capture readSamples=${diagnostics.readSamples} outputFrames=${diagnostics.outputFrames} " +
+                        "rawDbFs=${"%.1f".format(diagnostics.rawDbFs)} outputDbFs=${"%.1f".format(diagnostics.outputDbFs)} " +
+                        "format=${diagnostics.sampleRate}Hz/${diagnostics.channels}ch " +
+                        "vadAudioFrames=${vadAudioFrames.get()} sentBytes=${sentAudioBytes.get()}",
+                )
             },
             onError = { error ->
                 mainHandler.post { fail(error.message ?: "内部音频采集失败") }
@@ -310,6 +333,7 @@ class TranslationService : Service(), GeminiSessionListener {
         private const val EXTRA_RESULT_DATA = "result_data"
         private const val NOTIFICATION_CHANNEL_ID = "live_translation"
         private const val NOTIFICATION_ID = 2107
+        private const val LOG_TAG = "GlobalLiveTranslator"
 
         fun start(context: Context, resultCode: Int, resultData: Intent) {
             val intent = Intent(context, TranslationService::class.java)

@@ -40,6 +40,7 @@ class GeminiProtocolTest {
                 listener.details,
             )
             assertEquals(listOf("你好"), listener.translations)
+            assertTrue(listener.diagnostics.none { it.contains("你好") })
         } finally {
             session.stop()
         }
@@ -89,9 +90,107 @@ class GeminiProtocolTest {
 
     @Test
     fun errorsRedactQueryKey() {
-        val sanitized = GeminiLiveSession.sanitizeError("failed wss://host/path?key=super-secret&x=1")
+        val apiKey = "AIza" + "A".repeat(32)
+        val sanitized = GeminiLiveSession.sanitizeError(
+            "failed wss://host/path?key=super-secret&x=1 API key: $apiKey",
+        )
         assertFalse(sanitized.contains("super-secret"))
+        assertFalse(sanitized.contains(apiKey))
         assertTrue(sanitized.contains("[redacted]"))
+    }
+
+    @Test
+    fun serverErrorsAreStructuredAndRedacted() {
+        val error = JSONObject()
+            .put("code", 400)
+            .put("status", "INVALID_ARGUMENT")
+            .put("message", "bad request https://host/path?key=super-secret")
+
+        val sanitized = GeminiLiveSession.serverErrorMessage(error)
+
+        assertTrue(sanitized.contains("code=400"))
+        assertTrue(sanitized.contains("status=INVALID_ARGUMENT"))
+        assertFalse(sanitized.contains("super-secret"))
+    }
+
+    @Test
+    fun serverMessageKindsDoNotInspectTranscriptText() {
+        assertEquals(
+            GeminiMessageKind.SERVER_CONTENT,
+            GeminiLiveSession.classifyMessage(JSONObject("""{"serverContent":{"outputTranscription":{}}}""")),
+        )
+        assertEquals(
+            GeminiMessageKind.SERVER_ERROR,
+            GeminiLiveSession.classifyMessage(JSONObject("""{"error":{"code":400}}""")),
+        )
+        assertEquals(GeminiMessageKind.OTHER, GeminiLiveSession.classifyMessage(JSONObject()))
+    }
+
+    @Test
+    fun modelTurnTextIsUsedWhenOutputTranscriptionIsMissing() {
+        val serverContent = JSONObject(
+            """{"modelTurn":{"parts":[{"text":"hidden","thought":true},{"text":"Hello "},{"inlineData":{"data":"ignored"}},{"text":"world"}]}}""",
+        )
+
+        assertEquals("Hello world", GeminiLiveSession.extractModelText(serverContent))
+    }
+
+    @Test
+    fun modelTurnTextTravelsThroughTheTranscriptListener() {
+        val listener = RecordingListener()
+        val session = GeminiLiveSession(AppSettings(), listener)
+        val webSocket = FakeWebSocket()
+
+        try {
+            session.start(connectImmediately = false)
+            val socketListener = session.createListener(0)
+            socketListener.onMessage(webSocket, """{"setupComplete":{}}""")
+            socketListener.onMessage(
+                webSocket,
+                """{"serverContent":{"modelTurn":{"parts":[{"text":"translated sentinel"}]}}}""",
+            )
+
+            assertEquals(listOf("translated sentinel"), listener.translations)
+            assertTrue(listener.diagnostics.none { it.contains("translated sentinel") })
+        } finally {
+            session.stop()
+        }
+    }
+
+    @Test
+    fun topLevelServerErrorIsSurfaced() {
+        val listener = RecordingListener()
+        val session = GeminiLiveSession(AppSettings(), listener)
+
+        try {
+            session.start(connectImmediately = false)
+            session.createListener(0).onMessage(
+                FakeWebSocket(),
+                """{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad request"}}""",
+            )
+
+            assertEquals(1, listener.errors.size)
+            assertTrue(listener.errors.single().contains("INVALID_ARGUMENT"))
+        } finally {
+            session.stop()
+        }
+    }
+
+    @Test
+    fun rejectedAudioSendIsCounted() {
+        val listener = RecordingListener()
+        val session = GeminiLiveSession(AppSettings(), listener)
+        val webSocket = FakeWebSocket(sendResult = false)
+
+        try {
+            session.start(connectImmediately = false)
+            session.createListener(0).onMessage(webSocket, """{"setupComplete":{}}""")
+            session.sendAudio(byteArrayOf(1, 2, 3, 4))
+
+            assertTrue(listener.diagnostics.any { it.contains("sendRejected=1") })
+        } finally {
+            session.stop()
+        }
     }
 
     @Test
@@ -105,6 +204,8 @@ class GeminiProtocolTest {
         val statuses = mutableListOf<GeminiSessionStatus>()
         val details = mutableListOf<String>()
         val translations = mutableListOf<String>()
+        val diagnostics = mutableListOf<String>()
+        val errors = mutableListOf<String>()
 
         override fun onStatus(status: GeminiSessionStatus, detail: String) {
             statuses += status
@@ -121,17 +222,23 @@ class GeminiProtocolTest {
 
         override fun onAudioSent(bytes: Int) = Unit
 
-        override fun onError(message: String) = Unit
+        override fun onDiagnostics(message: String) {
+            diagnostics += message
+        }
+
+        override fun onError(message: String) {
+            errors += message
+        }
     }
 
-    private class FakeWebSocket : WebSocket {
+    private class FakeWebSocket(private val sendResult: Boolean = true) : WebSocket {
         override fun request(): Request = Request.Builder().url("https://example.invalid").build()
 
         override fun queueSize(): Long = 0
 
-        override fun send(text: String): Boolean = true
+        override fun send(text: String): Boolean = sendResult
 
-        override fun send(bytes: ByteString): Boolean = true
+        override fun send(bytes: ByteString): Boolean = sendResult
 
         override fun close(code: Int, reason: String?): Boolean = true
 

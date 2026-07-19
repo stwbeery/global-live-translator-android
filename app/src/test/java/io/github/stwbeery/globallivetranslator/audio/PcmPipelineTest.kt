@@ -40,4 +40,12 @@ class PcmPipelineTest {
         gate.process(silence)
         assertTrue(gate.process(silence).contains(VadEvent.StreamEnd))
     }
+
+    @Test
+    fun dbFsReportsSilenceAndKnownAmplitude() {
+        assertEquals(-120f, VadGate.dbFs(ByteArray(3)))
+        val halfScale = byteArrayOf(0, 64, 0, 64, 0, 64, 0, 64)
+        assertEquals(-6.02f, VadGate.dbFs(halfScale), 0.02f)
+        assertEquals(-6.02f, pcm16DbFs(shortArrayOf(16_384, 16_384)), 0.02f)
+    }
 }

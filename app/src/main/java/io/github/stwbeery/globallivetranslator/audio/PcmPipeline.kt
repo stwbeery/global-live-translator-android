@@ -130,21 +130,39 @@ class VadGate(
         open = false
     }
 
-    private fun dbFs(frame: ByteArray): Float {
-        if (frame.size < 2) return -120f
-        var sumSquares = 0.0
-        var samples = 0
-        var index = 0
-        while (index + 1 < frame.size) {
-            val sample = ((frame[index].toInt() and 0xff) or (frame[index + 1].toInt() shl 8)).toShort().toInt()
-            val normalized = sample / 32768.0
-            sumSquares += normalized * normalized
-            samples++
-            index += 2
+    companion object {
+        fun dbFs(frame: ByteArray): Float {
+            return pcm16LeDbFs(frame)
         }
-        if (sumSquares == 0.0 || samples == 0) return -120f
-        return (20.0 * log10(sqrt(sumSquares / samples))).toFloat()
     }
+}
+
+internal fun pcm16LeDbFs(frame: ByteArray): Float {
+    if (frame.size < 2) return -120f
+    var sumSquares = 0.0
+    var samples = 0
+    var index = 0
+    while (index + 1 < frame.size) {
+        val sample = ((frame[index].toInt() and 0xff) or (frame[index + 1].toInt() shl 8)).toShort().toInt()
+        val normalized = sample / 32768.0
+        sumSquares += normalized * normalized
+        samples++
+        index += 2
+    }
+    if (sumSquares == 0.0 || samples == 0) return -120f
+    return (20.0 * log10(sqrt(sumSquares / samples))).toFloat()
+}
+
+internal fun pcm16DbFs(samples: ShortArray, length: Int = samples.size): Float {
+    require(length in 0..samples.size)
+    if (length == 0) return -120f
+    var sumSquares = 0.0
+    for (index in 0 until length) {
+        val normalized = samples[index] / 32768.0
+        sumSquares += normalized * normalized
+    }
+    if (sumSquares == 0.0) return -120f
+    return (20.0 * log10(sqrt(sumSquares / length))).toFloat()
 }
 
 private fun ShortArray.toPcm16Le(): ByteArray {
